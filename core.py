@@ -155,4 +155,5 @@ class Function:
     def backward(self, x):
         raise NotImplementedError()
 
-
+class Parameter(Variable):
+    pass
