@@ -3,6 +3,7 @@ import numpy as np
 import dezero
 from dezero import utils
 from dezero.core import *
+from dezero.cuda import get_array_module
 
 
 # ============================================================================================================
@@ -129,24 +130,15 @@ class Pow(Function):
 def pow(x, c):
     return Pow(c)(x)
 
-def setup_variable():
-    Variable.__add__ = add
-    Variable.__radd__ = add
-    Variable.__mul__ = mul
-    Variable.__rmul__ = mul
-    Variable.__neg__ = neg
-    Variable.__sub__ = sub
-    Variable.__rsub__ = rsub
-    Variable.__truediv__ = div
-    Variable.__rtruediv__ = rdiv
-    Variable.__pow__ = pow
+
 
 # ============================================================================================================
 # Basis functions: sin / cos / tanh / exp / log
 # ============================================================================================================
 class Sin(Function):
     def forward(self, x):
-        y = np.sin(x)
+        xp = get_array_module(x)
+        y = xp.sin(x)
         return y
 
     def backward(self, gy):
@@ -159,7 +151,8 @@ def sin(x):
 
 class Cos(Function):
     def forward(self, x):
-        y = np.cos(x)
+        xp = get_array_module(x)
+        y = xp.cos(x)
         return y
 
     def backward(self, gy):
@@ -172,7 +165,8 @@ def cos(x):
 
 class Exp(Function):
     def forward(self, x):
-        y = np.exp(x)
+        xp = get_array_module(x)
+        y = xp.exp(x)
         return y
 
     def backward(self, gy):
@@ -185,7 +179,8 @@ def exp(x):
 
 class Tanh(Function):
     def forward(self, x):
-        y = np.tanh(x)
+        xp = get_array_module(x)
+        y = xp.tanh(x)
         return y
 
     def backward(self, gy):
@@ -218,7 +213,8 @@ def reshape(x, shape):
 
 class Transpose(Function):
     def forward(self, x):
-        return np.transpose(x)
+        xp = get_array_module(x)
+        return xp.transpose(x)
 
     def backward(self, gy):
         return transpose(gy)
@@ -242,10 +238,15 @@ class GetItem(Function):
 class GetItemGrad(Function):
     def __init__(self, slices, x_shape):
         self.slices = slices
-        self.in_shape = in_shape
+        self.x_shape = x_shape
 
     def forward(self, gy):
-        gx = np.zeros(self.x_shape, dtype=gy.dtype)
+        xp = get_array_module(gy)
+        gx = xp.zeros(self.x_shape, dtype=gy.dtype)
+        if xp is np:
+            np.add.at(gx, self.slices, gy)
+        else:
+            xp.scatter_add(gx, self.slices, gy)
         return gx
 
     def backward(self, ggx):
@@ -309,7 +310,8 @@ class BroadcastTo(Function):
 
     def forward(self, x):
         self.x_shape = x.shape
-        y = np.broadcast_to(x, self.shape)
+        xp = get_array_module(x)
+        y = xp.broadcast_to(x, self.shape)
         return y
 
     def backward(self, gy):
@@ -364,7 +366,8 @@ def linear(x, W, b=None):
 # ============================================================================================================
 class Sigmoid(Function):
     def forward(self, x):
-        y = 1 / (1 + np.exp(-x))
+        xp = get_array_module(x)
+        y = 1 / (1 + xp.exp(-x))
         return y
 
     def backward(self, gy):
@@ -380,8 +383,9 @@ class Softmax(Function):
         self.axis = axis
 
     def forward(self, x):
+        xp = get_array_module(x)
         y = x - x.max(axis=self.axis, keepdims=True)
-        y = np.exp(y)
+        y = xp.exp(y)
         y = y / y.sum(axis=self.axis, keepdims=True)
         return y
 
@@ -397,7 +401,8 @@ def softmax(x, axis=1):
 
 class ReLU(Function):
     def forward(self, x):
-        y = np.maximum(x, 0.0)
+        xp = get_array_module(x)
+        y = xp.maximum(x, 0.0)
         return y
 
     def backward(self, gy):
@@ -415,7 +420,8 @@ class LeakyReLU(Function):
 
     def forward(self, x):
         y = x.copy()
-        y[x <= 0] *= self.slope
+        xp = get_array_module(x)
+        y[x <= 0] = y[x <= 0] * self.slope # Corrected from y[x <= 0] *= self.slope
         return y
 
     def backward(self, gy):
@@ -450,19 +456,22 @@ def mean_square_error(x0, x1):
 class SoftmaxCrossEntropy(Function):
     def forward(self, x, t):
         N = x.shape[0]
+        xp = get_array_module(x)
         log_z = utils.logsumexp(x, axis=1)
         log_p = x - log_z 
-        log_p = log_p[np.arange(N), t.ravel()]
-        y = -log_p.sum() / np.float32(N)
+        log_p = log_p[xp.arange(N), t.ravel()]
+        y = -log_p.sum() / xp.float32(N)
         return y
 
     def backward(self, gy):
         x, t = self.inputs
-        N, CLS_NUM = x.x_shape
+        N, CLS_NUM = x.shape
+        xp = get_array_module(x)
 
         gy *= 1.0 / N 
         y = softmax(x)
-        t_onehot = np.zeros_like(y)
+        t_onehot = xp.zeros(y.shape, dtype=y.dtype)
+        t_onehot[xp.arange(N), t.data.ravel()] = 1
         y = (y - t_onehot) * gy
         return y
 
@@ -488,3 +497,27 @@ def binary_cross_entropy(x, t):
     tlog_p = t * log(p) + (1 - t) * log(1 - p)
     y = -1 * sum(tlog_p) / N 
     return y
+
+def accuracy(y, t):
+    y, t = as_variable(y), as_variable(t)
+    xp = get_array_module(y)
+
+    pred = y.data.argmax(axis=1).reshape(t.shape)
+    result = (pred == t.data)
+    acc = result.mean()
+    return Variable(as_array(acc, xp))
+
+def dropout(x, dropout_ratio=0.5):
+    x = as_variable(x)
+
+    if dezero.Config.train:
+        xp = get_array_module(x)
+        mask = xp.random.rand(*x.shape) > dropout_ratio
+        scale = xp.array(1.0 - dropout_ratio).astype(x.dtype)
+        y = x * mask / scale
+        return y
+    else:
+        return x
+
+from dezero.functions_conv import (average_pooling, col2im, conv2d, deconv2d,
+                                   im2col, pooling)

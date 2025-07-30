@@ -4,10 +4,15 @@ import weakref
 import numpy as np
 
 import dezero
+from dezero.cuda import get_array_module, is_cupy_available, to_cpu, to_gpu
+
+if is_cupy_available:
+    import cupy
 
 
 class Config:
     enable_backprop = True
+    train = True
 
 
 @contextlib.contextmanager
@@ -19,6 +24,9 @@ def using_config(name, value):
     finally:
         setattr(Config, name, old_value)
 
+def test_mode():
+    return using_config('train', False)
+
 def no_grad():
     return using_config('enable_backprop', False)
 
@@ -29,7 +37,8 @@ class Variable:
 
     def __init__(self, data, name=None):
         if data is not None:
-            if not isinstance(data, np.ndarray):
+            # Allow cupy.ndarray
+            if not isinstance(data, (np.ndarray, cupy.ndarray) if is_cupy_available else np.ndarray):
                 raise TypeError('{}: invalid type'.format(type(data)))
 
         self.data = data
@@ -60,6 +69,8 @@ class Variable:
     def __repr__(self):
         if self.data is None:
             return 'variable(None)'
+        
+        # Support cupy
         p = str(self.data).replace('\n', '\n' + ' ' * 9)
         return 'variable(' + p + ')'
 
@@ -70,10 +81,23 @@ class Variable:
     def cleargrad(self):
         self.grad = None
 
+    def sum(self, axis=None, keepdims=False):
+        return dezero.functions.sum(self, axis, keepdims)
+
+    def to_cpu(self):
+        if self.data is not None:
+            self.data = to_cpu(self.data)
+
+    def to_gpu(self):
+        if self.data is not None:
+            self.data = to_gpu(self.data)
+
 
     def backward(self, retain_grad=False, create_graph=False):
         if self.grad is None:
-            self.grad = Variable(np.ones_like(self.data))
+            # Support cupy
+            xp = get_array_module(self.data)
+            self.grad = Variable(xp.ones_like(self.data))
 
         funcs = []
         seen_set = set()
@@ -107,6 +131,36 @@ class Variable:
                 for y in f.outputs:
                     y().grad = None
 
+    def __add__(self, other):
+        return dezero.functions.add(self, other)
+
+    def __radd__(self, other):
+        return dezero.functions.add(other, self)
+
+    def __mul__(self, other):
+        return dezero.functions.mul(self, other)
+
+    def __rmul__(self, other):
+        return dezero.functions.mul(other, self)
+
+    def __neg__(self):
+        return dezero.functions.neg(self)
+
+    def __sub__(self, other):
+        return dezero.functions.sub(self, other)
+
+    def __rsub__(self, other):
+        return dezero.functions.sub(other, self)
+
+    def __truediv__(self, other):
+        return dezero.functions.div(self, other)
+
+    def __rtruediv__(self, other):
+        return dezero.functions.div(other, self)
+
+    def __pow__(self, other):
+        return dezero.functions.pow(self, other)
+
     def reshape(self, *shape):
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = shape[0]
@@ -119,9 +173,10 @@ class Variable:
     def T(self):
         return self.transpose()
 
-def as_array(x):
+# Support cupy
+def as_array(x, array_module=np):
     if np.isscalar(x):
-        return np.array(x)
+        return array_module.array(x)
     return x
 
 def as_variable(obj):
@@ -132,13 +187,15 @@ def as_variable(obj):
 
 class Function:
     def __call__(self, *inputs):
+        # Support cupy
         inputs = [as_variable(x) for x in inputs]
 
         xs = [x.data for x in inputs]
+        xp = get_array_module(*xs)
         ys = self.forward(*xs)
         if not isinstance(ys, tuple):
             ys = (ys,)
-        outputs = [Variable(as_array(y)) for y in ys]
+        outputs = [Variable(as_array(y, xp)) for y in ys]
 
         if Config.enable_backprop:
             self.generation = max([x.generation for x in inputs])
